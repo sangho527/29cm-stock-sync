@@ -324,7 +324,7 @@ SM_ROWS_JS = r"""
     }
     const oc = cells.findIndex(c => /\[수정\]/.test(c.innerText || '') && norm(c.innerText).length < 60);
     if (oc < 0 || !cells[oc + off]) continue;
-    const option = norm(cells[oc].innerText.replace(/\[(수정|내역)\]/g, ' '));
+    const option = norm(cells[oc].innerText.replace(/\[(수정|내역)\]|\(품절\)/g, ' '));
     out.push({product: cur, lines, option, stock: norm(cells[oc + off].innerText)});
   }
   return out;
@@ -364,31 +364,45 @@ def sellmate_stock(sm, name, pauser):
     if inp is None:
         dump(sm, "셀메이트_검색창없음")
         raise RuntimeError("셀메이트 통합검색 입력칸을 찾지 못했어요.")
-    inp.fill(name)
-    inp.press("Enter")
-    settle(sm)
 
-    res = None
-    for fr in sm.frames:
-        try:
-            res = fr.evaluate(SM_ROWS_JS)
-            if res:
-                break
-        except Exception:
-            pass
-    if not res:
+    # 전체 이름으로 먼저 검색하고, 결과가 없으면 끝 단어(컬러)를 하나씩 빼고 다시 검색
+    # 예) 'Louvre Handmade Wool Coat CAMEL' → 'Louvre Handmade Wool Coat'
+    words = name.split()
+    terms = [" ".join(words[:len(words) - k]) for k in range(0, 3) if len(words) - k >= 2]
+    saw_table = False
+    for term in terms:
+        inp.fill(term)
+        inp.press("Enter")
+        settle(sm)
+        res = None
+        for fr in sm.frames:
+            try:
+                res = fr.evaluate(SM_ROWS_JS)
+                if res is not None:
+                    break
+            except Exception:
+                pass
+        if res is not None:
+            saw_table = True
+        if not res:
+            continue
+        # 상품명이 정확히 같은 상품만 (비슷한 이름의 다른 상품 재고가 섞이지 않게)
+        rows = [r for r in res if any(squash(l) == squash(term) for l in r["lines"])]
+        if not rows:
+            rows = [r for r in res if squash(term) in squash(r["product"])]
+        if not rows:
+            continue
+        if term != name:
+            log(f"  셀메이트는 '{term}'(으)로 검색됨 → 옵션의 컬러로 구분")
+        stock = {}
+        for r in rows:
+            key = r["option"] or "(옵션없음)"
+            stock[key] = stock.get(key, 0) + to_int(r["stock"])
+        return stock
+
+    if not saw_table:
         dump(sm, "셀메이트_표없음")
-        raise RuntimeError("셀메이트 결과 표('상품옵션'·'재고' 열)를 찾지 못했어요.")
-
-    # 상품명이 정확히 같은 상품만 (비슷한 이름의 다른 상품 재고가 섞이지 않게)
-    rows = [r for r in res if any(squash(l) == squash(name) for l in r["lines"])]
-    if not rows:
-        rows = [r for r in res if squash(name) in squash(r["product"])] or res
-    stock = {}
-    for r in rows:
-        key = r["option"] or "(옵션없음)"
-        stock[key] = stock.get(key, 0) + to_int(r["stock"])
-    return stock
+    return {}
 
 
 # --------------------------- 29커넥트 ----------------------------
@@ -524,10 +538,14 @@ def fill_options(detail, sm_stock, product_name=""):
         ot = tokens(r["option"])
         loc = detail.locator(f'[data-sync-section="1"] [data-sync-idx="{r["idx"]}"]')
         # 셀메이트 옵션 단어가 29CM 옵션에 모두 들어 있고, 29CM 옵션 단어는 (셀메이트 옵션 + 상품명)으로 모두 설명돼야 함
-        cands = [k for k, t in sm_tok.items() if ot and t and t <= ot and ot <= (t | name_tok)]
+        # 셀메이트 옵션 단어는 (29CM 옵션명 + 상품명)에, 29CM 옵션명 단어는 (셀메이트 옵션 + 상품명)에 모두 있어야 짝
+        # 예) 셀메이트 'CAMEL M' ↔ 29CM 'CAMEL M' 또는 'M'(상품명에 CAMEL) / 셀메이트 'M'(상품명에 BROWN) ↔ 29CM 'BROWN M'
+        cands = [k for k, t in sm_tok.items()
+                 if ot and t and t <= (ot | name_tok) and ot <= (t | name_tok)]
         if cands:
-            best = max(len(sm_tok[k]) for k in cands)
-            cands = [k for k in cands if len(sm_tok[k]) == best]
+            score = lambda k: (len(sm_tok[k] & ot), len(sm_tok[k]))
+            best = max(score(k) for k in cands)
+            cands = [k for k in cands if score(k) == best]
         if len(cands) != 1:
             loc.evaluate("e => e.style.outline = '3px solid red'")
             why = "셀메이트에서 못 찾음" if not cands else f"후보 여러 개({', '.join(cands)})"
@@ -543,7 +561,7 @@ def fill_options(detail, sm_stock, product_name=""):
 
     extra = [k for k in sm_stock if k not in used]
     if extra:
-        lines.append("\n[셀메이트에는 있는데 29CM 옵션과 매칭 안 된 항목]")
+        lines.append("\n[참고] 이번에 쓰지 않은 셀메이트 옵션 (다른 컬러 옵션이면 정상)")
         lines += [f"  · {k}: {sm_stock[k]}" for k in extra]
 
     after = detail.evaluate(SNAPSHOT_OUTSIDE_JS)
@@ -616,7 +634,13 @@ def main():
                         break
                     continue
                 if not sm_stock:
-                    log("  셀메이트 검색 결과 없음 → 건너뜀")
+                    log("  셀메이트 검색 결과 없음")
+                    r = pauser.ask(f"{row}행 '{name}' - 셀메이트 검색 결과 없음",
+                                   "셀메이트에서 이 상품을 찾지 못했어요 (끝의 컬러를 빼고 다시 검색해도 없음).\n"
+                                   "29CM 재고는 바꾸지 않고 다음 상품으로 넘어가요.",
+                                   [("다음 상품", "next"), ("중지", "stop")], sm)
+                    if r == "stop":
+                        break
                     continue
                 log(f"  셀메이트: {sm_stock}")
 
