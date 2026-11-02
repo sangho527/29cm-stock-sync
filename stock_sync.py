@@ -325,7 +325,9 @@ SM_ROWS_JS = r"""
     const oc = cells.findIndex(c => /\[수정\]/.test(c.innerText || '') && norm(c.innerText).length < 60);
     if (oc < 0 || !cells[oc + off]) continue;
     const option = norm(cells[oc].innerText.replace(/\[(수정|내역)\]|\(품절\)/g, ' '));
-    out.push({product: cur, lines, option, stock: norm(cells[oc + off].innerText)});
+    const gc = gi >= 0 ? cells[oc + (gi - oh)] : null;
+    out.push({product: cur, lines, option, stock: norm(cells[oc + off].innerText),
+              grade: gc ? norm(gc.innerText) : ''});
   }
   return out;
 }
@@ -333,6 +335,15 @@ SM_ROWS_JS = r"""
 
 
 SM_CACHE = {}   # 이번 실행 동안 셀메이트 검색 결과 기억 (같은 상품의 다른 컬러 행은 다시 검색하지 않음)
+
+
+def is_excluded(r):
+    """셀메이트에서 제외할 행: 상품명이 '- Z'로 끝나는 상품, 또는 등급 '우수관리'이면서 재고 0"""
+    if any(len(l) < 80 and re.search(r"-\s*Z$", l.strip(), re.I) for l in r["lines"]):
+        return True
+    if r.get("grade") == "우수관리" and to_int(r["stock"]) == 0:
+        return True
+    return False
 
 
 def find_sm_input(sm):
@@ -395,14 +406,15 @@ def sellmate_stock(sm, name, pauser):
                 pass
         if res is not None:
             saw_table = True
+        if res:
+            res = [r for r in res if not is_excluded(r)]
         if not res:
             if res is not None:
                 SM_CACHE[term] = {}
             continue
         # 상품명이 정확히 같은 상품만 (비슷한 이름의 다른 상품 재고가 섞이지 않게)
+        # (이름이 '포함'만 된 다른 상품은 쓰지 않음 — 예: 'Amazing Hoody'로 BLACK·NAVY 상품 재고가 합쳐지는 것 방지)
         rows = [r for r in res if any(squash(l) == squash(term) for l in r["lines"])]
-        if not rows:
-            rows = [r for r in res if squash(term) in squash(r["product"])]
         if not rows:
             SM_CACHE[term] = {}
             continue
