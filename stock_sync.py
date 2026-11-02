@@ -332,6 +332,9 @@ SM_ROWS_JS = r"""
 """
 
 
+SM_CACHE = {}   # 이번 실행 동안 셀메이트 검색 결과 기억 (같은 상품의 다른 컬러 행은 다시 검색하지 않음)
+
+
 def find_sm_input(sm):
     for _ in range(20):                  # 새로 고침 중이면 최대 10초 기다림
         for fr in sm.frames:
@@ -373,6 +376,11 @@ def sellmate_stock(sm, name, pauser):
     terms = [" ".join(words[:len(words) - k]) for k in range(0, 3) if len(words) - k >= 2]
     saw_table = False
     for term in terms:
+        if term in SM_CACHE:
+            if SM_CACHE[term]:
+                log(f"  셀메이트 '{term}' 결과 재사용 (이미 검색함)")
+                return SM_CACHE[term]
+            continue
         inp = find_sm_input(sm)          # 검색하면 페이지가 새로 고쳐지므로 매번 다시 찾음
         inp.fill(term, timeout=10000)
         inp.press("Enter")
@@ -388,12 +396,15 @@ def sellmate_stock(sm, name, pauser):
         if res is not None:
             saw_table = True
         if not res:
+            if res is not None:
+                SM_CACHE[term] = {}
             continue
         # 상품명이 정확히 같은 상품만 (비슷한 이름의 다른 상품 재고가 섞이지 않게)
         rows = [r for r in res if any(squash(l) == squash(term) for l in r["lines"])]
         if not rows:
             rows = [r for r in res if squash(term) in squash(r["product"])]
         if not rows:
+            SM_CACHE[term] = {}
             continue
         if term != name:
             log(f"  셀메이트는 '{term}'(으)로 검색됨 → 옵션의 컬러로 구분")
@@ -401,6 +412,7 @@ def sellmate_stock(sm, name, pauser):
         for r in rows:
             key = r["option"] or "(옵션없음)"
             stock[key] = stock.get(key, 0) + to_int(r["stock"])
+        SM_CACHE[term] = stock
         return stock
 
     if not saw_table:
@@ -662,7 +674,7 @@ def main():
                         detail.bring_to_front()
                         detail.locator("section > button h2", has_text="옵션/재고 설정").first.wait_for(timeout=20000)
 
-                        report = fill_options(detail, sm_stock, name)
+                        report = fill_options(detail, sm_stock, f"{name} {it['name']}")   # 엑셀 상품명 + 29CM 상품명의 컬러로 구분
                         if report is None:
                             report = ("옵션/재고 표를 찾지 못해 입력하지 못했어요.\n"
                                       "직접 입력하거나 [건너뛰기]를 눌러주세요.\n"
