@@ -249,6 +249,22 @@ SM_SEARCH_INPUT = ("xpath=//th[contains(normalize-space(.),'통합검색')]"
                    "/following-sibling::td[1]//input[@type='text' or not(@type)]")
 
 
+# '통합검색' 드롭다운 바로 뒤에 있는 텍스트 입력칸에 표시를 붙임
+MARK_SM_INPUT_JS = r"""
+() => {
+  const sel = [...document.querySelectorAll('select')].find(s =>
+    [...s.options].some(o => o.text.replace(/\s+/g, '') === '통합검색'));
+  if (!sel) return false;
+  const inputs = [...document.querySelectorAll('input')].filter(i =>
+    (!i.type || ['text', 'search'].includes(i.type)) && i.offsetParent !== null &&
+    (sel.compareDocumentPosition(i) & Node.DOCUMENT_POSITION_FOLLOWING));
+  if (!inputs.length) return false;
+  document.querySelectorAll('[data-sync-search]').forEach(e => e.removeAttribute('data-sync-search'));
+  inputs[0].setAttribute('data-sync-search', '1');
+  return true;
+}
+"""
+
 SELECTED_JS = r"""
 () => {
   for (const el of document.querySelectorAll('button, span, a, div')) {
@@ -290,7 +306,16 @@ def sellmate_stock(sm, name, pauser):
         if r == "go":
             break
 
-    inp = find_in_frames(sm, SM_SEARCH_INPUT)
+    inp = None
+    for fr in sm.frames:
+        try:
+            if fr.evaluate(MARK_SM_INPUT_JS):
+                inp = fr.locator('[data-sync-search="1"]').first
+                break
+        except Exception:
+            pass
+    if inp is None:
+        inp = find_in_frames(sm, SM_SEARCH_INPUT)
     if inp is None:
         dump(sm, "셀메이트_검색창없음")
         raise RuntimeError("셀메이트 통합검색 입력칸을 찾지 못했어요.")
