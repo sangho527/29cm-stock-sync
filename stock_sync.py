@@ -33,6 +33,7 @@ EXCEL_BOOK = "29CM_상품관리"       # 열려 있는 엑셀 파일 이름(일�
 EXCEL_SHEET = None                 # 시트 이름. None이면 현재 보고 있는 시트
 NAME_COL = "B"
 DONE_COLOR = (112, 173, 71)        # 완료 표시 초록
+ENDED_COLOR = (255, 255, 0)        # 29CM 판매종료 표시 노랑
 
 SELLMATE_URL_KEY = "sellmate"                 # 셀메이트 탭 주소에 들어있는 글자
 CM_LIST_URL_KEY = "partner-item.29cm.co.kr/list"
@@ -584,6 +585,28 @@ def main():
                     continue
                 log(f"{row}행: {name}")
 
+                # 29CM 먼저 검색 (판매중 상품이 있을 때만 셀메이트 조회)
+                found = cm_search(cm, name)
+                items = [i for i in found if i["status"] == "판매중"]
+                if not items:
+                    if found and all(i["status"] == "판매종료" for i in found):
+                        info = "\n".join(f"  · {i['no']}  {i['name']}  [{i['status']}]" for i in found)
+                        log("  29CM 검색 결과가 판매종료뿐 → 일시정지")
+                        r = pauser.ask(
+                            f"{row}행 '{name}' - 판매종료 상품",
+                            f"29CM 검색 결과가 판매종료 상품뿐이에요.\n\n{info}\n\n"
+                            "[계속하기]를 누르면 엑셀 B열에 노란색으로 표시하고 다음 상품으로 넘어가요.",
+                            [("계속하기 (노란색 표시)", "ok"), ("표시 없이 넘어가기", "skip"),
+                             ("중지", "stop")], cm)
+                        if r == "stop":
+                            break
+                        if r == "ok":
+                            cell.color = ENDED_COLOR
+                            log("  → 판매종료 (노란색 표시)")
+                    else:
+                        log("  29CM 판매중 상품 없음 → 건너뜀")
+                    continue
+
                 try:
                     sm_stock = sellmate_stock(sm, name, pauser)
                 except RuntimeError as e:
@@ -596,11 +619,6 @@ def main():
                     log("  셀메이트 검색 결과 없음 → 건너뜀")
                     continue
                 log(f"  셀메이트: {sm_stock}")
-
-                items = [i for i in cm_search(cm, name) if i["status"] == "판매중"]
-                if not items:
-                    log("  29CM 판매중 상품 없음 → 건너뜀")
-                    continue
 
                 done_any, stop = False, False
                 for it in items:
