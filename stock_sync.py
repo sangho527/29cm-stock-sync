@@ -346,6 +346,19 @@ def is_excluded(r):
     return False
 
 
+def color_suffix(lines, term):
+    """상품정보 줄 중 '검색어 + 1~2단어'인 상품명이 있으면 뒤 단어(컬러)를 돌려줌"""
+    t = re.sub(r"\s+", " ", term).strip().lower()
+    for l in lines:
+        l = re.sub(r"\s+", " ", l).strip()
+        if len(l) > 80 or not l.lower().startswith(t + " "):
+            continue
+        sfx = l[len(t):].strip()
+        if 1 <= len(sfx.split()) <= 2 and not re.search(r"[\d/|]", sfx):
+            return sfx.upper()
+    return None
+
+
 def find_sm_input(sm):
     for _ in range(20):                  # 새로 고침 중이면 최대 10초 기다림
         for fr in sm.frames:
@@ -415,14 +428,27 @@ def sellmate_stock(sm, name, pauser):
         # 상품명이 정확히 같은 상품만 (비슷한 이름의 다른 상품 재고가 섞이지 않게)
         # (이름이 '포함'만 된 다른 상품은 쓰지 않음 — 예: 'Amazing Hoody'로 BLACK·NAVY 상품 재고가 합쳐지는 것 방지)
         rows = [r for r in res if any(squash(l) == squash(term) for l in r["lines"])]
+        prefix = {}
+        if not rows:
+            # 정확히 같은 상품이 없으면 '검색어 + 컬러' 이름의 상품들을 모음
+            # 예) 'Amazing hoody' → 'Amazing Hoody BLACK', 'Amazing Hoody NAVY' (옵션 앞에 컬러를 붙여 구분)
+            for r in res:
+                sfx = color_suffix(r["lines"], term)
+                if sfx:
+                    prefix[id(r)] = sfx
+            rows = [r for r in res if id(r) in prefix]
         if not rows:
             SM_CACHE[term] = {}
             continue
-        if term != name:
+        if prefix:
+            log(f"  셀메이트 '{term}' + 컬러 상품 {len(set(prefix.values()))}개({', '.join(sorted(set(prefix.values())))})로 구분")
+        elif term != name:
             log(f"  셀메이트는 '{term}'(으)로 검색됨 → 옵션의 컬러로 구분")
         stock = {}
         for r in rows:
             key = r["option"] or "(옵션없음)"
+            if id(r) in prefix:
+                key = f"{prefix[id(r)]} {key}"
             stock[key] = stock.get(key, 0) + to_int(r["stock"])
         SM_CACHE[term] = stock
         return stock
