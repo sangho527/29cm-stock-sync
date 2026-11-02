@@ -332,6 +332,22 @@ SM_ROWS_JS = r"""
 """
 
 
+def find_sm_input(sm):
+    for _ in range(20):                  # 새로 고침 중이면 최대 10초 기다림
+        for fr in sm.frames:
+            try:
+                if fr.evaluate(MARK_SM_INPUT_JS):
+                    return fr.locator('[data-sync-search="1"]').first
+            except Exception:
+                pass
+        inp = find_in_frames(sm, SM_SEARCH_INPUT)
+        if inp is not None:
+            return inp
+        sm.wait_for_timeout(500)
+    dump(sm, "셀메이트_검색창없음")
+    raise RuntimeError("셀메이트 통합검색 입력칸을 찾지 못했어요.")
+
+
 def sellmate_stock(sm, name, pauser):
     """셀메이트에서 검색 → {옵션문자열: 재고합계}"""
     sm.bring_to_front()
@@ -351,27 +367,14 @@ def sellmate_stock(sm, name, pauser):
         if r == "go":
             break
 
-    inp = None
-    for fr in sm.frames:
-        try:
-            if fr.evaluate(MARK_SM_INPUT_JS):
-                inp = fr.locator('[data-sync-search="1"]').first
-                break
-        except Exception:
-            pass
-    if inp is None:
-        inp = find_in_frames(sm, SM_SEARCH_INPUT)
-    if inp is None:
-        dump(sm, "셀메이트_검색창없음")
-        raise RuntimeError("셀메이트 통합검색 입력칸을 찾지 못했어요.")
-
     # 전체 이름으로 먼저 검색하고, 결과가 없으면 끝 단어(컬러)를 하나씩 빼고 다시 검색
     # 예) 'Louvre Handmade Wool Coat CAMEL' → 'Louvre Handmade Wool Coat'
     words = name.split()
     terms = [" ".join(words[:len(words) - k]) for k in range(0, 3) if len(words) - k >= 2]
     saw_table = False
     for term in terms:
-        inp.fill(term)
+        inp = find_sm_input(sm)          # 검색하면 페이지가 새로 고쳐지므로 매번 다시 찾음
+        inp.fill(term, timeout=10000)
         inp.press("Enter")
         settle(sm)
         res = None
@@ -601,92 +604,110 @@ def main():
                 name = str(cell.value or "").strip()
                 if not name or is_colored(cell):
                     continue
-                log(f"{row}행: {name}")
+                try:
+                    log(f"{row}행: {name}")
 
-                # 29CM 먼저 검색 (판매중 상품이 있을 때만 셀메이트 조회)
-                found = cm_search(cm, name)
-                items = [i for i in found if i["status"] == "판매중"]
-                if not items:
-                    if found and all(i["status"] == "판매종료" for i in found):
-                        info = "\n".join(f"  · {i['no']}  {i['name']}  [{i['status']}]" for i in found)
-                        log("  29CM 검색 결과가 판매종료뿐 → 일시정지")
-                        r = pauser.ask(
-                            f"{row}행 '{name}' - 판매종료 상품",
-                            f"29CM 검색 결과가 판매종료 상품뿐이에요.\n\n{info}\n\n"
-                            "[계속하기]를 누르면 엑셀 B열에 노란색으로 표시하고 다음 상품으로 넘어가요.",
-                            [("계속하기 (노란색 표시)", "ok"), ("표시 없이 넘어가기", "skip"),
-                             ("중지", "stop")], cm)
+                    # 29CM 먼저 검색 (판매중 상품이 있을 때만 셀메이트 조회)
+                    found = cm_search(cm, name)
+                    items = [i for i in found if i["status"] == "판매중"]
+                    if not items:
+                        if found and all(i["status"] == "판매종료" for i in found):
+                            info = "\n".join(f"  · {i['no']}  {i['name']}  [{i['status']}]" for i in found)
+                            log("  29CM 검색 결과가 판매종료뿐 → 일시정지")
+                            r = pauser.ask(
+                                f"{row}행 '{name}' - 판매종료 상품",
+                                f"29CM 검색 결과가 판매종료 상품뿐이에요.\n\n{info}\n\n"
+                                "[계속하기]를 누르면 엑셀 B열에 노란색으로 표시하고 다음 상품으로 넘어가요.",
+                                [("계속하기 (노란색 표시)", "ok"), ("표시 없이 넘어가기", "skip"),
+                                 ("중지", "stop")], cm)
+                            if r == "stop":
+                                break
+                            if r == "ok":
+                                cell.color = ENDED_COLOR
+                                log("  → 판매종료 (노란색 표시)")
+                        else:
+                            log("  29CM 판매중 상품 없음 → 건너뜀")
+                        continue
+
+                    try:
+                        sm_stock = sellmate_stock(sm, name, pauser)
+                    except RuntimeError as e:
+                        r = pauser.ask(f"{row}행 '{name}' - 셀메이트 오류", str(e),
+                                       [("다음 상품", "next"), ("중지", "stop")], sm)
                         if r == "stop":
                             break
-                        if r == "ok":
-                            cell.color = ENDED_COLOR
-                            log("  → 판매종료 (노란색 표시)")
-                    else:
-                        log("  29CM 판매중 상품 없음 → 건너뜀")
-                    continue
+                        continue
+                    if not sm_stock:
+                        log("  셀메이트 검색 결과 없음")
+                        r = pauser.ask(f"{row}행 '{name}' - 셀메이트 검색 결과 없음",
+                                       "셀메이트에서 이 상품을 찾지 못했어요 (끝의 컬러를 빼고 다시 검색해도 없음).\n"
+                                       "29CM 재고는 바꾸지 않고 다음 상품으로 넘어가요.",
+                                       [("다음 상품", "next"), ("중지", "stop")], sm)
+                        if r == "stop":
+                            break
+                        continue
+                    log(f"  셀메이트: {sm_stock}")
 
-                try:
-                    sm_stock = sellmate_stock(sm, name, pauser)
-                except RuntimeError as e:
-                    r = pauser.ask(f"{row}행 '{name}' - 셀메이트 오류", str(e),
-                                   [("다음 상품", "next"), ("중지", "stop")], sm)
-                    if r == "stop":
-                        break
-                    continue
-                if not sm_stock:
-                    log("  셀메이트 검색 결과 없음")
-                    r = pauser.ask(f"{row}행 '{name}' - 셀메이트 검색 결과 없음",
-                                   "셀메이트에서 이 상품을 찾지 못했어요 (끝의 컬러를 빼고 다시 검색해도 없음).\n"
-                                   "29CM 재고는 바꾸지 않고 다음 상품으로 넘어가요.",
-                                   [("다음 상품", "next"), ("중지", "stop")], sm)
-                    if r == "stop":
-                        break
-                    continue
-                log(f"  셀메이트: {sm_stock}")
-
-                done_any, stop = False, False
-                for it in items:
-                    pages_before = len(ctx.pages)
-                    link = cm.get_by_text(it["no"], exact=True).first
-                    try:
-                        with ctx.expect_page(timeout=8000) as pi:
-                            link.click()
-                        detail = pi.value
-                    except PWTimeout:
-                        detail = cm if len(ctx.pages) == pages_before else ctx.pages[-1]
-                    detail.wait_for_load_state("domcontentloaded")
-                    detail.bring_to_front()
-                    detail.locator("section > button h2", has_text="옵션/재고 설정").first.wait_for(timeout=20000)
-
-                    report = fill_options(detail, sm_stock, name)
-                    if report is None:
-                        report = ("옵션/재고 표를 찾지 못해 입력하지 못했어요.\n"
-                                  "직접 입력하거나 [건너뛰기]를 눌러주세요.\n"
-                                  f"(진단 파일이 '{DIAG_DIR}' 폴더에 저장됐어요)")
-                    log("  " + report.replace("\n", "\n  "))
-
-                    r = pauser.ask(
-                        f"{row}행 · {it['name']} ({it['no']})",
-                        report + "\n\n파란 테두리 = 입력함, 빨간 테두리 = 매칭 실패\n"
-                                 "확인 후 브라우저에서 [수정완료]를 직접 누르고 [계속하기]를 눌러주세요.",
-                        [("계속하기 (완료 표시)", "ok"), ("건너뛰기", "skip"), ("중지", "stop")],
-                        detail)
-                    if detail is not cm:
+                    done_any, stop = False, False
+                    for it in items:
+                        pages_before = len(ctx.pages)
+                        link = cm.get_by_text(it["no"], exact=True).first
                         try:
-                            detail.close()
+                            with ctx.expect_page(timeout=8000) as pi:
+                                link.click()
+                            detail = pi.value
+                        except PWTimeout:
+                            detail = cm if len(ctx.pages) == pages_before else ctx.pages[-1]
+                        detail.wait_for_load_state("domcontentloaded")
+                        detail.bring_to_front()
+                        detail.locator("section > button h2", has_text="옵션/재고 설정").first.wait_for(timeout=20000)
+
+                        report = fill_options(detail, sm_stock, name)
+                        if report is None:
+                            report = ("옵션/재고 표를 찾지 못해 입력하지 못했어요.\n"
+                                      "직접 입력하거나 [건너뛰기]를 눌러주세요.\n"
+                                      f"(진단 파일이 '{DIAG_DIR}' 폴더에 저장됐어요)")
+                        log("  " + report.replace("\n", "\n  "))
+
+                        r = pauser.ask(
+                            f"{row}행 · {it['name']} ({it['no']})",
+                            report + "\n\n파란 테두리 = 입력함, 빨간 테두리 = 매칭 실패\n"
+                                     "확인 후 브라우저에서 [수정완료]를 직접 누르고 [계속하기]를 눌러주세요.",
+                            [("계속하기 (완료 표시)", "ok"), ("건너뛰기", "skip"), ("중지", "stop")],
+                            detail)
+                        if detail is not cm:
+                            try:
+                                detail.close()
+                            except Exception:
+                                pass
+                        if r == "ok":
+                            done_any = True
+                        elif r == "stop":
+                            stop = True
+                            break
+
+                    if done_any:
+                        cell.color = DONE_COLOR
+                        log("  → 완료 (초록 표시)")
+                    if stop:
+                        break
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    log(f"  예기치 못한 오류: {type(e).__name__}: {e}")
+                    for pg in (sm, cm):
+                        try:
+                            dump(pg, "예기치못한오류")
                         except Exception:
                             pass
-                    if r == "ok":
-                        done_any = True
-                    elif r == "stop":
-                        stop = True
+                    r = pauser.ask(f"{row}행 '{name}' - 오류",
+                                   f"처리 중 오류가 났어요.\n{type(e).__name__}: {str(e)[:500]}\n\n"
+                                   "29CM 상세 창이 열려 있다면 [수정완료]를 누르지 말고 닫아주세요.\n"
+                                   "[다음 상품]을 누르면 이 행은 그대로 두고 넘어가요.",
+                                   [("다음 상품", "next"), ("중지", "stop")])
+                    if r == "stop":
                         break
 
-                if done_any:
-                    cell.color = DONE_COLOR
-                    log("  → 완료 (초록 표시)")
-                if stop:
-                    break
         except KeyboardInterrupt:
             pass
         log("===== 종료 =====")
