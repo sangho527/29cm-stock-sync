@@ -298,6 +298,39 @@ def selected_label(page):
     return ""
 
 
+# 셀메이트 결과: 각 행에서 '[수정]'이 붙은 칸 = 옵션, 그 칸 기준으로 '등급' 오른쪽 '재고' 칸을 찾음
+SM_ROWS_JS = r"""
+() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  const head = [...document.querySelectorAll('tr')].find(tr => {
+    const t = [...tr.children].map(c => norm(c.innerText));
+    return t.includes('상품옵션') && t.includes('재고');
+  });
+  if (!head) return null;
+  const hs = [...head.children].map(c => norm(c.innerText));
+  const oh = hs.indexOf('상품옵션'), gi = hs.indexOf('등급');
+  let si = gi >= 0 ? hs.findIndex((x, i) => i > gi && x === '재고') : -1;
+  if (si < 0) si = hs.indexOf('재고');
+  const off = si - oh;
+  const out = []; let cur = '', lines = [];
+  for (const tr of document.querySelectorAll('tr')) {
+    if (tr === head) continue;
+    const cells = [...tr.children];
+    const pc = cells.find(c => /상품코드|등록일자/.test(c.innerText || ''));
+    if (pc) {                                             // 상품정보 칸(첫 옵션 행에만 있음)
+      cur = norm(pc.innerText);
+      lines = [...pc.querySelectorAll('*')].map(e => norm(e.innerText)).concat(pc.innerText.split('\n').map(norm)).filter(Boolean);
+    }
+    const oc = cells.findIndex(c => /\[수정\]/.test(c.innerText || '') && norm(c.innerText).length < 60);
+    if (oc < 0 || !cells[oc + off]) continue;
+    const option = norm(cells[oc].innerText.replace(/\[(수정|내역)\]/g, ' '));
+    out.push({product: cur, lines, option, stock: norm(cells[oc + off].innerText)});
+  }
+  return out;
+}
+"""
+
+
 def sellmate_stock(sm, name, pauser):
     """셀메이트에서 검색 → {옵션문자열: 재고합계}"""
     sm.bring_to_front()
@@ -334,33 +367,26 @@ def sellmate_stock(sm, name, pauser):
     inp.press("Enter")
     settle(sm)
 
-    grid = read_grid(sm, ["등급", "재고"])
-    if not grid:
+    res = None
+    for fr in sm.frames:
+        try:
+            res = fr.evaluate(SM_ROWS_JS)
+            if res:
+                break
+        except Exception:
+            pass
+    if not res:
         dump(sm, "셀메이트_표없음")
-        raise RuntimeError("셀메이트 결과 표('등급'·'재고' 열)를 찾지 못했어요.")
+        raise RuntimeError("셀메이트 결과 표('상품옵션'·'재고' 열)를 찾지 못했어요.")
 
-    h = grid["headers"]
-    gi = h.index("등급")
-    si = next((i for i in range(gi + 1, len(h)) if h[i] == "재고"), gi + 1)
-    opt_idx = [i for i, x in enumerate(h)
-               if re.search(r"옵션|색상|컬러|사이즈", x) and "코드" not in x]
-    name_idx = next((i for i, x in enumerate(h) if "상품명" in x or x == "상품정보"), None)
-
-    rows = [r for r in grid["rows"] if len(r) > si]
-    if name_idx is not None:
-        same = [r for r in rows if len(r) > name_idx and squash(name) in squash(r[name_idx])]
-        if same:
-            rows = same
-
+    # 상품명이 정확히 같은 상품만 (비슷한 이름의 다른 상품 재고가 섞이지 않게)
+    rows = [r for r in res if any(squash(l) == squash(name) for l in r["lines"])]
+    if not rows:
+        rows = [r for r in res if squash(name) in squash(r["product"])] or res
     stock = {}
     for r in rows:
-        if opt_idx:
-            key = " ".join(r[i] for i in opt_idx if i < len(r))
-        else:
-            key = ""
-        key = re.sub(r"\[(수정|내역)\]", " ", key)
-        key = re.sub(r"\s+", " ", key).strip() or "(옵션없음)"
-        stock[key] = stock.get(key, 0) + to_int(r[si])
+        key = r["option"] or "(옵션없음)"
+        stock[key] = stock.get(key, 0) + to_int(r["stock"])
     return stock
 
 
@@ -408,9 +434,18 @@ OPTION_ROWS_JS = r"""
   const val = c => {
     const i = c.querySelector('input:not([type=checkbox]):not([type=radio]), select');
     if (i) return norm(i.value);
-    const leaves = [...c.querySelectorAll('*')].filter(e => !e.children.length)
-                     .map(e => norm(e.textContent)).filter(Boolean);   // 칩(SALT BLACK / S)을 각각 읽기
-    return leaves.length ? leaves.join(' ') : norm(c.innerText);
+    // 화면에 보이는 글자만, 칩(BROWN / S)마다 띄어서 읽기 (숨은 '색상'·'사이즈' 라벨 제외)
+    const parts = []; const w = document.createTreeWalker(c, NodeFilter.SHOW_TEXT);
+    while (w.nextNode()) {
+      const t = norm(w.currentNode.textContent), el = w.currentNode.parentElement;
+      if (!t || !el) continue;
+      const st = getComputedStyle(el);
+      if (st.display === 'none' || st.visibility === 'hidden' || el.getClientRects().length === 0) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 1 || r.height <= 1) continue;
+      parts.push(t);
+    }
+    return parts.length ? parts.join(' ') : norm(c.innerText);
   };
   document.querySelectorAll('[data-sync-idx]').forEach(e => e.removeAttribute('data-sync-idx'));
   const res = []; let idx = 0; let hs = null, si = -1, oi = [];
