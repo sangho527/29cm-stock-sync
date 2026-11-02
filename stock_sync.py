@@ -113,10 +113,10 @@ class Pauser:
         self.title = tk.Label(self.root, font=("맑은 고딕", 12, "bold"),
                               wraplength=600, justify="left")
         self.title.pack(anchor="w", padx=10, pady=(10, 4))
+        self.btns = tk.Frame(self.root)
+        self.btns.pack(side="bottom", pady=10)          # 버튼을 항상 맨 아래에 보이게
         self.text = scrolledtext.ScrolledText(self.root, font=("맑은 고딕", 10))
         self.text.pack(fill="both", expand=True, padx=10)
-        self.btns = tk.Frame(self.root)
-        self.btns.pack(pady=10)
         self.choice = None
         self.root.protocol("WM_DELETE_WINDOW", lambda: self._set("stop"))
         self.root.withdraw()
@@ -249,16 +249,36 @@ SM_SEARCH_INPUT = ("xpath=//th[contains(normalize-space(.),'통합검색')]"
                    "/following-sibling::td[1]//input[@type='text' or not(@type)]")
 
 
+SELECTED_JS = r"""
+() => {
+  for (const el of document.querySelectorAll('button, span, a, div')) {
+    const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+    if (/^\d+ selected$/.test(t)) return t;      // 정확히 'N selected' 인 요소만
+  }
+  return '';
+}
+"""
+
+
+def selected_label(page):
+    for fr in page.frames:
+        try:
+            t = fr.evaluate(SELECTED_JS)
+            if t:
+                return t
+        except Exception:
+            pass
+    return ""
+
+
 def sellmate_stock(sm, name, pauser):
     """셀메이트에서 검색 → {옵션문자열: 재고합계}"""
     sm.bring_to_front()
 
     # 기준 필터 9개 창고 확인
     while True:
-        btn = find_in_frames(sm, "xpath=//*[self::button or self::span or self::div]"
-                                 "[contains(normalize-space(.),'selected')]")
-        txt = btn.inner_text().strip() if btn else ""
-        if f"{WAREHOUSE_COUNT} selected" in txt:
+        txt = selected_label(sm)
+        if txt == f"{WAREHOUSE_COUNT} selected":
             break
         r = pauser.ask("셀메이트 '기준' 필터 확인 필요",
                        f"기준 필터가 '{txt or '확인 불가'}' 상태예요.\n"
