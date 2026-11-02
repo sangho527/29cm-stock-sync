@@ -373,56 +373,102 @@ def cm_search(cm, name):
     return out
 
 
+# 29CM 상세 화면의 '옵션/재고 설정' 섹션만 대상으로 함 (다른 섹션은 절대 건드리지 않음)
+FIND_SECTION_JS = r"""
+() => {
+  const sec = [...document.querySelectorAll('section')].find(s => {
+    const h = s.querySelector(':scope > button h2');
+    return h && h.innerText.replace(/\s+/g, ' ').trim() === '옵션/재고 설정';
+  });
+  if (!sec) return 'none';
+  document.querySelectorAll('[data-sync-section]').forEach(e => e.removeAttribute('data-sync-section'));
+  sec.setAttribute('data-sync-section', '1');
+  return sec.children.length > 1 ? 'open' : 'closed';   // 접혀 있으면 내용 영역이 없음
+}
+"""
+
 OPTION_ROWS_JS = r"""
 () => {
+  const sec = document.querySelector('[data-sync-section="1"]');
+  if (!sec) return [];
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
   const val = c => {
-    const i = c.querySelector('input:not([type=checkbox]), select');
+    const i = c.querySelector('input:not([type=checkbox]):not([type=radio]), select');
     return i ? norm(i.value) : norm(c.innerText);
   };
-  const res = []; let idx = 0;
-  for (const t of document.querySelectorAll('table')) {
-    const hr = [...t.querySelectorAll('tr')].find(tr =>
-      [...tr.children].some(c => /재고/.test(c.innerText || '')));
-    if (!hr) continue;
-    const hs = [...hr.children].map(c => norm(c.innerText));
-    const si = hs.findIndex(x => /재고/.test(x));
-    const oi = hs.map((x, i) => i).filter(i => i !== si && /옵션|컬러|색상|사이즈|size|color/i.test(hs[i]));
-    for (const tr of t.querySelectorAll('tr')) {
-      if (tr === hr) continue;
-      const cells = [...tr.children];
-      if (cells.length !== hs.length) continue;
-      const inp = cells[si] && cells[si].querySelector('input');
-      if (!inp) continue;
-      let opt = oi.map(i => val(cells[i])).filter(Boolean).join(' ');
-      if (!opt) opt = cells.filter((c, i) => i !== si).map(c => norm(c.innerText)).filter(Boolean).join(' ');
-      inp.setAttribute('data-sync-idx', String(idx));
-      res.push({idx, option: opt, current: inp.value});
-      idx++;
+  document.querySelectorAll('[data-sync-idx]').forEach(e => e.removeAttribute('data-sync-idx'));
+  const res = []; let idx = 0; let hs = null, si = -1, oi = [];
+  for (const tr of sec.querySelectorAll('tr')) {          // 섹션 안의 행만
+    const cells = [...tr.children];
+    if (cells.some(c => c.tagName === 'TH')) {             // 헤더 행
+      const h = cells.map(c => norm(c.innerText));
+      const k = h.findIndex(x => /재고/.test(x));
+      if (k >= 0) {
+        hs = h; si = k;
+        oi = h.map((x, i) => i).filter(i => i !== si && /옵션|컬러|색상|사이즈|size|color/i.test(h[i]));
+      }
+      continue;
     }
+    if (!hs || cells.length !== hs.length) continue;
+    const inp = cells[si].querySelector('input:not([type=checkbox]):not([type=radio])');
+    if (!inp || inp.disabled || inp.readOnly) continue;
+    let opt = oi.map(i => val(cells[i])).filter(Boolean).join(' ');
+    if (!opt) opt = cells.filter((c, i) => i !== si).map(c => norm(c.innerText)).filter(Boolean).join(' ');
+    inp.setAttribute('data-sync-idx', String(idx));
+    res.push({idx, option: opt, current: inp.value});
+    idx++;
   }
   return res;
 }
 """
 
+# 옵션/재고 섹션 밖의 모든 입력값 스냅샷 (입력 전후 비교로 다른 정보가 바뀌지 않았는지 검사)
+SNAPSHOT_OUTSIDE_JS = r"""
+() => {
+  const sec = document.querySelector('[data-sync-section="1"]');
+  return [...document.querySelectorAll('input, textarea, select')]
+    .filter(e => !(sec && sec.contains(e)))
+    .map(e => (e.type === 'checkbox' || e.type === 'radio') ? String(e.checked) : (e.value || ''));
+}
+"""
+
+
+def open_option_section(detail):
+    """옵션/재고 설정 섹션이 접혀 있으면 펼침. 이미 펼쳐져 있으면 아무것도 누르지 않음."""
+    state = detail.evaluate(FIND_SECTION_JS)
+    if state == "none":
+        return False
+    sec = detail.locator('[data-sync-section="1"]')
+    if state == "closed":
+        sec.locator(":scope > button").click()
+        for _ in range(30):
+            detail.wait_for_timeout(300)
+            if detail.evaluate(FIND_SECTION_JS) == "open":
+                break
+    sec.scroll_into_view_if_needed()
+    detail.wait_for_timeout(800)
+    return detail.evaluate(FIND_SECTION_JS) == "open"
+
 
 def fill_options(detail, sm_stock):
     """29CM 옵션 행마다 셀메이트 재고 매칭 후 입력. 결과 리포트 문자열 반환."""
-    nav = detail.get_by_text("옵션/재고 설정", exact=True)
-    nav.last.click()
-    detail.wait_for_timeout(1500)
+    if not open_option_section(detail):
+        dump(detail, "29CM_옵션섹션못염")
+        return None
 
     rows = detail.evaluate(OPTION_ROWS_JS)
     if not rows:
         dump(detail, "29CM_옵션표없음")
         return None
 
+    before = detail.evaluate(SNAPSHOT_OUTSIDE_JS)
+
     sm_tok = {k: tokens(k) for k in sm_stock}
     lines, used = [], set()
     for r in rows:
         ot = tokens(r["option"])
         cands = [k for k, t in sm_tok.items() if ot and ot <= t]
-        loc = detail.locator(f'[data-sync-idx="{r["idx"]}"]')
+        loc = detail.locator(f'[data-sync-section="1"] [data-sync-idx="{r["idx"]}"]')
         if not cands:
             loc.evaluate("e => e.style.outline = '3px solid red'")
             lines.append(f"❌ {r['option']:<30} 셀메이트에서 못 찾음 (입력 안 함, 현재 {r['current']})")
@@ -439,6 +485,13 @@ def fill_options(detail, sm_stock):
     if extra:
         lines.append("\n[셀메이트에는 있는데 29CM 옵션과 매칭 안 된 항목]")
         lines += [f"  · {k}: {sm_stock[k]}" for k in extra]
+
+    after = detail.evaluate(SNAPSHOT_OUTSIDE_JS)
+    if before != after:
+        lines.insert(0, "⚠️⚠️ 경고: 옵션/재고 외 다른 칸의 값이 바뀐 것 같아요. "
+                        "[수정완료]를 누르지 말고 창을 닫거나 [건너뛰기] 하세요. ⚠️⚠️\n")
+    else:
+        lines.insert(0, "🔒 옵션/재고 설정 외 다른 정보(가격·판매·배송·이미지 등)는 변경되지 않았어요.\n")
     return "\n".join(lines)
 
 
@@ -502,7 +555,7 @@ def main():
                         detail = cm if len(ctx.pages) == pages_before else ctx.pages[-1]
                     detail.wait_for_load_state("domcontentloaded")
                     detail.bring_to_front()
-                    detail.get_by_text("옵션/재고 설정", exact=True).last.wait_for(timeout=20000)
+                    detail.locator("section > button h2", has_text="옵션/재고 설정").first.wait_for(timeout=20000)
 
                     report = fill_options(detail, sm_stock)
                     if report is None:
