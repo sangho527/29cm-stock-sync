@@ -168,8 +168,19 @@ READ_GRID_JS = r"""
       const grid = t.closest('.ui-jqgrid, [class*="grid"], [class*="Grid"]');
       if (grid) body = [...grid.querySelectorAll('tr')].filter(tr => tr !== headRow && !t.contains(tr));
     }
-    const rows = body.map(tr => [...tr.children].map(c => norm(c.innerText)))
-                     .filter(r => r.length >= headers.length - 1 && r.some(x => x));
+    // 합쳐진 칸(rowspan/colspan)을 아래 행에도 채워 넣어 열 위치가 밀리지 않게 함
+    const carry = []; const rows = [];
+    for (const tr of body) {
+      const out = []; let col = 0;
+      const fillCarry = () => { while (carry[col] && carry[col].rem > 0) { out[col] = carry[col].text; carry[col].rem--; col++; } };
+      for (const c of tr.children) {
+        fillCarry();
+        const t = norm(c.innerText), rs = c.rowSpan || 1, cs = c.colSpan || 1;
+        for (let k = 0; k < cs; k++) { out[col] = t; if (rs > 1) carry[col] = {text: t, rem: rs - 1}; col++; }
+      }
+      while (col < carry.length) { if (carry[col] && carry[col].rem > 0) { out[col] = carry[col].text; carry[col].rem--; } col++; }
+      if (out.length >= headers.length - 1 && out.some(x => x)) rows.push(out.map(x => x || ''));
+    }
     return {headers, rows};
   }
   return null;
@@ -333,20 +344,22 @@ def sellmate_stock(sm, name, pauser):
     si = next((i for i in range(gi + 1, len(h)) if h[i] == "재고"), gi + 1)
     opt_idx = [i for i, x in enumerate(h)
                if re.search(r"옵션|색상|컬러|사이즈", x) and "코드" not in x]
-    name_idx = next((i for i, x in enumerate(h) if "상품명" in x), None)
+    name_idx = next((i for i, x in enumerate(h) if "상품명" in x or x == "상품정보"), None)
 
     rows = [r for r in grid["rows"] if len(r) > si]
     if name_idx is not None:
-        exact = [r for r in rows if len(r) > name_idx and squash(r[name_idx]) == squash(name)]
-        if exact:
-            rows = exact
+        same = [r for r in rows if len(r) > name_idx and squash(name) in squash(r[name_idx])]
+        if same:
+            rows = same
 
     stock = {}
     for r in rows:
         if opt_idx:
-            key = " ".join(r[i] for i in opt_idx if i < len(r)).strip()
+            key = " ".join(r[i] for i in opt_idx if i < len(r))
         else:
-            key = r[name_idx] if name_idx is not None else " ".join(r)
+            key = ""
+        key = re.sub(r"\[(수정|내역)\]", " ", key)
+        key = re.sub(r"\s+", " ", key).strip() or "(옵션없음)"
         stock[key] = stock.get(key, 0) + to_int(r[si])
     return stock
 
@@ -394,7 +407,10 @@ OPTION_ROWS_JS = r"""
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
   const val = c => {
     const i = c.querySelector('input:not([type=checkbox]):not([type=radio]), select');
-    return i ? norm(i.value) : norm(c.innerText);
+    if (i) return norm(i.value);
+    const leaves = [...c.querySelectorAll('*')].filter(e => !e.children.length)
+                     .map(e => norm(e.textContent)).filter(Boolean);   // 칩(SALT BLACK / S)을 각각 읽기
+    return leaves.length ? leaves.join(' ') : norm(c.innerText);
   };
   document.querySelectorAll('[data-sync-idx]').forEach(e => e.removeAttribute('data-sync-idx'));
   const res = []; let idx = 0; let hs = null, si = -1, oi = [];
@@ -405,7 +421,9 @@ OPTION_ROWS_JS = r"""
       const k = h.findIndex(x => /재고/.test(x));
       if (k >= 0) {
         hs = h; si = k;
-        oi = h.map((x, i) => i).filter(i => i !== si && /옵션|컬러|색상|사이즈|size|color/i.test(h[i]));
+        oi = h.map((x, i) => i).filter(i => h[i] === '옵션명');
+        if (!oi.length) oi = h.map((x, i) => i).filter(i => i !== si &&
+          /옵션명|컬러|색상|사이즈|size|color/i.test(h[i]) && !/번호|코드|금액|가격|추가|상태/.test(h[i]));
       }
       continue;
     }
@@ -450,7 +468,7 @@ def open_option_section(detail):
     return detail.evaluate(FIND_SECTION_JS) == "open"
 
 
-def fill_options(detail, sm_stock):
+def fill_options(detail, sm_stock, product_name=""):
     """29CM 옵션 행마다 셀메이트 재고 매칭 후 입력. 결과 리포트 문자열 반환."""
     if not open_option_section(detail):
         dump(detail, "29CM_옵션섹션못염")
@@ -463,23 +481,29 @@ def fill_options(detail, sm_stock):
 
     before = detail.evaluate(SNAPSHOT_OUTSIDE_JS)
 
+    name_tok = tokens(product_name)
     sm_tok = {k: tokens(k) for k in sm_stock}
     lines, used = [], set()
     for r in rows:
         ot = tokens(r["option"])
-        cands = [k for k, t in sm_tok.items() if ot and ot <= t]
         loc = detail.locator(f'[data-sync-section="1"] [data-sync-idx="{r["idx"]}"]')
-        if not cands:
+        # 셀메이트 옵션 단어가 29CM 옵션에 모두 들어 있고, 29CM 옵션 단어는 (셀메이트 옵션 + 상품명)으로 모두 설명돼야 함
+        cands = [k for k, t in sm_tok.items() if ot and t and t <= ot and ot <= (t | name_tok)]
+        if cands:
+            best = max(len(sm_tok[k]) for k in cands)
+            cands = [k for k in cands if len(sm_tok[k]) == best]
+        if len(cands) != 1:
             loc.evaluate("e => e.style.outline = '3px solid red'")
-            lines.append(f"❌ {r['option']:<30} 셀메이트에서 못 찾음 (입력 안 함, 현재 {r['current']})")
+            why = "셀메이트에서 못 찾음" if not cands else f"후보 여러 개({', '.join(cands)})"
+            lines.append(f"❌ {r['option']:<24} {why} → 입력 안 함 (현재 {r['current']})")
             continue
-        key = min(cands, key=lambda k: len(sm_tok[k]))
+        key = cands[0]
         used.add(key)
         n = sm_stock[key]
         v = convert_stock(n)
         loc.fill(str(v))
         loc.evaluate("e => e.style.outline = '3px solid #2f80ed'")
-        lines.append(f"✅ {r['option']:<30} 셀메이트 {n:>4} → 입력 {v:>3}   (기존 {r['current']})")
+        lines.append(f"✅ {r['option']:<24} ← 셀메이트 '{key}' {n}개 → 입력 {v}   (기존 {r['current']})")
 
     extra = [k for k in sm_stock if k not in used]
     if extra:
@@ -557,7 +581,7 @@ def main():
                     detail.bring_to_front()
                     detail.locator("section > button h2", has_text="옵션/재고 설정").first.wait_for(timeout=20000)
 
-                    report = fill_options(detail, sm_stock)
+                    report = fill_options(detail, sm_stock, name)
                     if report is None:
                         report = ("옵션/재고 표를 찾지 못해 입력하지 못했어요.\n"
                                   "직접 입력하거나 [건너뛰기]를 눌러주세요.\n"
